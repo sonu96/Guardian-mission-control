@@ -1,9 +1,11 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 import { authTables } from "@convex-dev/auth/server";
+import { optionsTables } from "./options-schema";
 
 export default defineSchema({
 	...authTables,
+	...optionsTables,
 		agents: defineTable({
 			name: v.string(),
 			role: v.string(),
