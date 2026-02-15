@@ -46,6 +46,7 @@ from agents.dealer import DealerAgent
 from agents.auditor import AuditorAgent
 from agents.monitor import MonitorAgent
 from services.hyperliquid_client import HyperliquidClient
+from services.polymarket_client import PolymarketClient
 from services.dashboard_reporter import DashboardReporter
 from config.settings import settings
 
@@ -78,6 +79,7 @@ class Orchestrator:
         # Shared infrastructure
         self.bus = AgentBus()
         self.hl_client = HyperliquidClient()
+        self.poly_client = PolymarketClient()
         self.reporter = DashboardReporter()
 
         # Initialize all agents
@@ -86,7 +88,7 @@ class Orchestrator:
         self.quant = QuantAgent(self.bus)
         self.sentinel = SentinelAgent(self.bus, self.hl_client)
         self.strategist = StrategistAgent(self.bus)
-        self.dealer = DealerAgent(self.bus, self.hl_client)
+        self.dealer = DealerAgent(self.bus, self.hl_client, self.poly_client)
         self.auditor = AuditorAgent(self.bus, self.hl_client)
         self.monitor = MonitorAgent(self.bus)
 
@@ -110,13 +112,25 @@ class Orchestrator:
         self.logger = logging.getLogger("orchestrator")
 
     async def start(self):
-        """Start all agents."""
+        """Start all agents and initialize Polymarket connection."""
         self.logger.info("Starting Guardian Agent System...")
         self.logger.info(f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
         self.logger.info(f"Cycle interval: {settings.agent.cycle_minutes} minutes")
         self.logger.info(f"Exit strategy: TP={settings.agent.exit_take_profit_pct}% / "
                         f"Trail={settings.agent.exit_trailing_stop_pct}% / "
                         f"SL={settings.agent.exit_stop_loss_pct}%")
+
+        # Initialize Polymarket client (CLOB + on-chain approvals)
+        try:
+            self.poly_client.initialize()
+            if self.poly_client.is_ready and not self.poly_client.is_read_only:
+                self.poly_client.ensure_approvals()
+                balance = self.poly_client.get_usdc_balance()
+                self.logger.info(f"Polymarket wallet ready — USDC balance: ${balance:.2f}")
+            elif self.poly_client.is_read_only:
+                self.logger.warning("No POLY_PRIVATE_KEY — running in simulation mode")
+        except Exception as e:
+            self.logger.error(f"Polymarket init failed: {e} — falling back to simulation")
 
         for agent in self.all_agents:
             await agent.start()
