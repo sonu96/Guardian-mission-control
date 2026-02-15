@@ -1,25 +1,25 @@
 """
 Guardian Agent Orchestrator — Main Entry Point.
 
-Full 1-hour cycle with active position management:
+Full 5-minute cycle with active position management:
 
-  PHASE 1 — ANALYZE (minutes 0-5):
+  PHASE 1 — ANALYZE (minutes 0-1):
     Step 1: Auditor evaluates previous cycle outcome
     Step 2: Oracle collects BTC data from Hyperliquid + Binance
     Step 3: Hawk + Quant + Sentinel analyze in parallel
     Step 4: Strategist aggregates signals → decision
     Step 5: Dealer places trade on Polymarket (if signal strong)
 
-  PHASE 2 — MONITOR (minutes 5-55):
+  PHASE 2 — MONITOR (minutes 1-4):
     Dealer actively watches the position:
-      - Polls BTC price from Hyperliquid every 30s
+      - Polls BTC price from Hyperliquid every 10s
       - Estimates Polymarket share price movement
       - Checks: take profit, trailing stop, stop loss
-      - At minute 30: re-runs Hawk+Sentinel for signal flip check
+      - At minute 2: re-runs Hawk+Sentinel for signal flip check
       - Exits early if any condition triggers
-    Monitor checks system health every 60s in parallel
+    Monitor checks system health in parallel
 
-  PHASE 3 — RESOLVE (minutes 55-60):
+  PHASE 3 — RESOLVE (minutes 4-5):
     If still in position: hold to market resolution
     Auditor will score the result at start of next cycle
 
@@ -67,7 +67,7 @@ class Orchestrator:
     Coordinates the multi-agent prediction cycle with active position management.
 
     The key change from v1: after placing a trade, the system does NOT sleep
-    for 60 minutes. Instead, the Dealer actively monitors the position using
+    for 5 minutes. Instead, the Dealer actively monitors the position using
     Hyperliquid BTC price data and can exit early for profit or loss protection.
     """
 
@@ -411,7 +411,7 @@ class Orchestrator:
             await self.monitor.execute_cycle(cycle_id)
 
             # Still need to wait for the window to complete
-            # so the next cycle aligns with the hourly boundary
+            # so the next cycle aligns with the 5-minute boundary
             wait_seconds = settings.agent.cycle_minutes * 60
             self.logger.info(f"Waiting {settings.agent.cycle_minutes}min for next cycle...")
             await asyncio.sleep(wait_seconds)

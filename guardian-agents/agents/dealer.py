@@ -2,16 +2,16 @@
 Dealer Agent — Polymarket-Only Trade Executor with Active Position Management.
 
 Responsibilities:
-  - Execute trades ONLY on Polymarket (1h BTC UP/DOWN binary markets)
+  - Execute trades ONLY on Polymarket (5-min BTC UP/DOWN binary markets)
   - Place limit orders on CLOB for better fills (or market orders if configured)
-  - ACTIVELY MONITOR positions during the 1-hour window
+  - ACTIVELY MONITOR positions during the 5-minute window
   - Exit early when conditions are met (take profit, trailing stop, stop loss)
   - Run mid-window signal re-check for signal flip detection
   - NO Hyperliquid trading — HL is data source only
 
 Position Lifecycle:
   1. ENTER  — Buy YES/NO shares based on Strategist decision
-  2. MONITOR — Poll BTC price every 30s, estimate share price, check exits
+  2. MONITOR — Poll BTC price every 10s, estimate share price, check exits
   3. EXIT   — One of:
      a) TAKE PROFIT    — Share price up enough, lock in gains
      b) TRAILING STOP  — Price peaked then pulled back, protect gains
@@ -105,10 +105,10 @@ class DealerAgent(BaseAgent):
 
     def _find_btc_market(self) -> Optional[dict]:
         """
-        Find the current 1-hour BTC UP/DOWN prediction market on Polymarket.
+        Find the current 5-minute BTC UP/DOWN prediction market on Polymarket.
         Uses Gamma API via PolymarketClient.
         """
-        return self.poly.find_btc_hourly_market()
+        return self.poly.find_btc_5min_market()
 
     async def _place_order(
         self,
@@ -255,7 +255,7 @@ class DealerAgent(BaseAgent):
         except Exception:
             entry_btc_price = 0.0
 
-        # Find the active BTC 1h market
+        # Find the active BTC 5-min market
         market = self._find_btc_market()
 
         if not market:

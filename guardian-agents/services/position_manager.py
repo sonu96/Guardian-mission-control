@@ -1,9 +1,9 @@
 """
-Position Manager — Active trade monitoring during the 1-hour window.
+Position Manager — Active trade monitoring during the 5-minute window.
 
-The core problem: Polymarket 1h BTC markets resolve at the candle close.
+The core problem: Polymarket 5-min BTC markets resolve at the candle close.
 But the share PRICE on the CLOB moves in real-time as BTC moves during
-the hour. This means:
+the window. This means:
 
   - If we buy YES @ $0.55 and BTC pumps early, YES shares might trade
     at $0.80 mid-window. We can SELL early and lock in profit without
@@ -25,7 +25,7 @@ Exit Strategy Hierarchy:
   4. SIGNAL FLIP    — Mid-window data check shows signal reversed
   5. TIME EXIT      — Hold to resolution if none of the above trigger
 
-The PositionManager polls Hyperliquid BTC price every 30s during the window.
+The PositionManager polls Hyperliquid BTC price every 10s during the window.
 It estimates what the Polymarket share price SHOULD be based on BTC movement,
 and triggers exits accordingly.
 """
@@ -67,13 +67,13 @@ class ExitStrategy:
     stop_loss_pct: float = 30.0  # e.g., bought @ 0.55, cut at 0.385
 
     # Signal flip: run a mid-window data check at this minute mark
-    mid_window_check_minute: int = 30
+    mid_window_check_minute: int = 2
 
     # Minimum hold time before any exit (avoid whipsaws), in seconds
-    min_hold_seconds: int = 120  # 2 minutes
+    min_hold_seconds: int = 30  # 30 seconds
 
     # How often to check BTC price (seconds)
-    poll_interval: int = 30
+    poll_interval: int = 10
 
 
 @dataclass
@@ -121,9 +121,9 @@ class PositionState:
           - BTC moves against us → share price decreases
           - Relationship is roughly: share_price ~ entry_price + delta * sensitivity
 
-        For a 1h BTC market, the share price sensitivity to BTC movement
-        is approximately:
-          - ~0.10 share price move per 0.5% BTC move (near 50/50 pricing)
+        For a 5-min BTC market, the share price sensitivity to BTC movement
+        is higher than hourly markets since smaller moves matter more:
+          - ~0.20 share price move per 0.1% BTC move (near 50/50 pricing)
           - Less sensitive near extremes (0.90+ or 0.10- share price)
         """
         self.current_btc_price = btc_price
@@ -138,8 +138,8 @@ class PositionState:
             btc_signal = -self.btc_change_pct
 
         # Sensitivity: how much share price moves per 1% BTC move
-        # Higher sensitivity near 0.50, lower near extremes
-        base_sensitivity = 0.15  # ~15 cents per 1% BTC move
+        # Higher for 5-min markets since smaller BTC moves are more decisive
+        base_sensitivity = 0.30  # ~30 cents per 1% BTC move (5-min markets are more sensitive)
         # Dampen near extremes using logistic-like curve
         dist_from_center = abs(self.entry_price - 0.50)
         sensitivity = base_sensitivity * (1.0 - dist_from_center * 1.5)
@@ -197,8 +197,8 @@ class PositionManager:
     """
     Actively monitors and manages an open Polymarket position.
 
-    Runs a polling loop during the 1-hour window that:
-      1. Fetches BTC price from Hyperliquid every 30s
+    Runs a polling loop during the 5-minute window that:
+      1. Fetches BTC price from Hyperliquid every 10s
       2. Estimates current Polymarket share price
       3. Checks exit conditions (take profit, trailing stop, stop loss)
       4. Optionally runs a mid-window signal re-check
@@ -337,14 +337,14 @@ class PositionManager:
 
     async def monitor_position(
         self,
-        window_seconds: int = 3600,
+        window_seconds: int = 300,
         signal_check_fn: Optional[Callable] = None,
     ) -> PositionState:
         """
         Main monitoring loop. Runs for the duration of the prediction window.
 
         Args:
-            window_seconds: Total window duration (default 3600 = 1 hour)
+            window_seconds: Total window duration (default 300 = 5 minutes)
             signal_check_fn: Optional async callable that returns True if
                            mid-window signal check says to flip/exit.
                            Called once at the mid-window mark.

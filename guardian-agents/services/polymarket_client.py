@@ -4,7 +4,7 @@ Polymarket Client — Lean wrapper for CLOB execution + Gamma market discovery.
 Extracted from https://github.com/Polymarket/agents — only the pieces we need:
   - CLOB client init + credential derivation
   - On-chain token approvals (USDC + CTF → exchange contracts)
-  - Gamma API for market/event discovery (find BTC 1h markets)
+  - Gamma API for market/event discovery (find BTC 5-min markets)
   - Order placement (limit + market)
   - Order selling (for early exits)
   - Balance checking
@@ -220,9 +220,9 @@ class PolymarketClient:
 
     # ── Gamma API — market discovery ─────────────────────────────────────────
 
-    def find_btc_hourly_market(self) -> Optional[dict]:
+    def find_btc_5min_market(self) -> Optional[dict]:
         """
-        Search Gamma API for the currently active BTC 1-hour prediction market.
+        Search Gamma API for the currently active BTC 5-minute prediction market.
 
         Returns market dict with keys: condition_id, question, tokens, etc.
         Returns None if no active market found.
@@ -233,7 +233,7 @@ class PolymarketClient:
                 "active": "true",
                 "closed": "false",
                 "archived": "false",
-                "limit": 50,
+                "limit": 100,
             }
             resp = requests.get(
                 f"{self._gamma_url}/markets",
@@ -243,32 +243,32 @@ class PolymarketClient:
             resp.raise_for_status()
             markets = resp.json()
 
-            # Filter for BTC hourly markets
-            btc_hourly = []
+            # Filter for BTC 5-minute markets
+            btc_5min = []
             for m in markets:
                 question = (m.get("question") or "").lower()
                 description = (m.get("description") or "").lower()
                 combined = question + " " + description
 
                 is_btc = any(kw in combined for kw in ["btc", "bitcoin"])
-                is_hourly = any(kw in combined for kw in [
-                    "1 hour", "1-hour", "one hour", "hourly",
-                    "next hour", "1h",
+                is_5min = any(kw in combined for kw in [
+                    "5 min", "5-min", "5min", "five min", "five-min",
+                    "5 minute", "5-minute", "five minute",
                 ])
                 is_up_down = any(kw in combined for kw in [
                     "up or down", "higher or lower", "above or below",
                     "increase", "decrease", "rise or fall",
                 ])
 
-                if is_btc and (is_hourly or is_up_down):
-                    btc_hourly.append(m)
+                if is_btc and is_5min:
+                    btc_5min.append(m)
 
-            if not btc_hourly:
-                logger.warning("No active BTC hourly markets found on Polymarket")
+            if not btc_5min:
+                logger.warning("No active BTC 5-minute markets found on Polymarket")
                 return None
 
             # Pick the one with the most liquidity / most recent
-            best = max(btc_hourly, key=lambda m: float(m.get("volume", 0) or 0))
+            best = max(btc_5min, key=lambda m: float(m.get("volume", 0) or 0))
 
             # Normalize token structure
             tokens = []
