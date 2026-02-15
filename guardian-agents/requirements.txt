@@ -3,6 +3,8 @@ hyperliquid-python-sdk>=0.22.0
 
 # Polymarket execution
 py-clob-client>=0.18.0
+py-order-utils>=0.3.0
+web3>=6.11.0
 
 # Technical analysis
 pandas>=2.2.0

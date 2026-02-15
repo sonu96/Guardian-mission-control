@@ -30,11 +30,17 @@ class PolymarketConfig(BaseSettings):
     """Polymarket CLOB configuration (execution venue)."""
 
     host: str = "https://clob.polymarket.com"
+    gamma_url: str = "https://gamma-api.polymarket.com"
+    rpc_url: str = "https://polygon-rpc.com"
     chain_id: int = 137  # Polygon
     private_key: str = ""
     api_key: str = ""
     api_secret: str = ""
     api_passphrase: str = ""
+
+    # Order execution
+    use_market_orders: bool = False  # True = FOK market orders, False = limit orders
+    limit_order_slippage: float = 0.02  # 2 cent slippage on limit sells for faster fills
 
     # Position sizing
     max_position_usd: float = 100.0

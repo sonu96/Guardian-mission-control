@@ -3,7 +3,7 @@ Dealer Agent — Polymarket-Only Trade Executor with Active Position Management.
 
 Responsibilities:
   - Execute trades ONLY on Polymarket (1h BTC UP/DOWN binary markets)
-  - Place limit orders on CLOB for better fills
+  - Place limit orders on CLOB for better fills (or market orders if configured)
   - ACTIVELY MONITOR positions during the 1-hour window
   - Exit early when conditions are met (take profit, trailing stop, stop loss)
   - Run mid-window signal re-check for signal flip detection
@@ -37,15 +37,17 @@ from agents.base import BaseAgent, AgentBus
 from models.signals import PredictionDecision, Direction
 from services.position_manager import PositionManager, ExitStrategy, ExitReason, PositionState
 from services.hyperliquid_client import HyperliquidClient
+from services.polymarket_client import PolymarketClient
 from config.settings import settings
 
 
 class DealerAgent(BaseAgent):
     """Executes and actively manages prediction trades on Polymarket."""
 
-    def __init__(self, bus: AgentBus, hl_client: HyperliquidClient):
+    def __init__(self, bus: AgentBus, hl_client: HyperliquidClient, poly_client: PolymarketClient):
         super().__init__("dealer", bus)
         self.hl = hl_client
+        self.poly = poly_client
 
         # Position management
         self.position_manager = PositionManager(
@@ -70,14 +72,18 @@ class DealerAgent(BaseAgent):
     async def start(self):
         await super().start()
         strategy = self.position_manager.strategy
+        mode = "LIVE" if self.poly.is_ready else "SIMULATION"
         self.logger.info(
-            f"Dealer ready — Polymarket executor | "
+            f"Dealer ready — {mode} mode | "
             f"Max: ${settings.polymarket.max_position_usd} | "
             f"TP: {strategy.take_profit_pct}% | "
             f"Trail: {strategy.trailing_stop_pct}% | "
             f"SL: {strategy.stop_loss_pct}% | "
             f"Poll: {strategy.poll_interval}s"
         )
+        if self.poly.is_ready:
+            balance = self.poly.get_usdc_balance()
+            self.logger.info(f"Wallet USDC balance: ${balance:.2f}")
 
     def _on_position_exit(self, position: PositionState, reason: ExitReason):
         """Callback when PositionManager exits a position."""
@@ -95,21 +101,14 @@ class DealerAgent(BaseAgent):
 
     def _on_price_tick(self, position: PositionState, tick_count: int):
         """Callback on each price tick — publishes live position to bus."""
-        # Publish live position state so Monitor and Dashboard can see it
-        # (fire-and-forget via sync, bus.publish is async but we're in sync callback)
         pass  # Position logging happens in PositionManager
 
     def _find_btc_market(self) -> Optional[dict]:
         """
         Find the current 1-hour BTC UP/DOWN prediction market on Polymarket.
-
-        In production, this queries the Polymarket CLOB API for active
-        BTC hourly markets. For now, returns the market structure.
+        Uses Gamma API via PolymarketClient.
         """
-        # TODO: Query Polymarket API for active BTC 1h markets
-        # GET https://clob.polymarket.com/markets
-        # Filter for: BTC, 1-hour resolution, currently tradeable
-        return None
+        return self.poly.find_btc_hourly_market()
 
     async def _place_order(
         self,
@@ -117,50 +116,116 @@ class DealerAgent(BaseAgent):
         side: str,
         size: float,
         price: float,
+        cost_usd: float,
     ) -> Optional[dict]:
         """
         Place an order on Polymarket CLOB.
-
-        In production, uses py-clob-client:
-            from py_clob_client.client import ClobClient
-            order = client.create_and_post_order(OrderArgs(...))
+        Uses limit orders by default, market orders if configured.
         """
-        # TODO: Implement actual Polymarket order execution
-        self.logger.info(
-            f"ORDER: {side} {size:.4f} shares @ ${price:.4f} (token: {token_id[:10]}...)"
-        )
+        if not self.poly.is_ready:
+            # Simulation mode — return mock order
+            self.logger.info(
+                f"SIM ORDER: {side} {size:.4f} shares @ ${price:.4f} (token: {token_id[:10]}...)"
+            )
+            return {
+                "order_id": f"sim_{datetime.now(timezone.utc).timestamp()}",
+                "token_id": token_id,
+                "side": side,
+                "size": size,
+                "price": price,
+                "status": "SIMULATED",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
-        return {
-            "order_id": f"sim_{datetime.now(timezone.utc).timestamp()}",
-            "token_id": token_id,
-            "side": side,
-            "size": size,
-            "price": price,
-            "status": "PLACED",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        if settings.polymarket.use_market_orders:
+            resp = self.poly.place_market_order(token_id=token_id, amount=cost_usd)
+        else:
+            resp = self.poly.place_limit_order(
+                token_id=token_id,
+                side=side,
+                size=size,
+                price=price,
+            )
+
+        if resp:
+            self.logger.info(
+                f"ORDER PLACED: {side} {size:.4f} shares @ ${price:.4f} "
+                f"(token: {token_id[:10]}...)"
+            )
+            return {
+                "order_id": resp.get("orderID") or resp.get("id", "unknown"),
+                "token_id": token_id,
+                "side": side,
+                "size": size,
+                "price": price,
+                "status": "PLACED",
+                "response": resp,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        self.logger.error(f"Order placement failed for {side} {size:.4f} @ ${price:.4f}")
+        return None
 
     async def _sell_position(self, position: PositionState) -> Optional[dict]:
         """
         Sell current Polymarket position for early exit.
-
-        In production, this places a SELL order on the CLOB at the
-        estimated share price (or slightly below for faster fill).
+        Places a SELL limit order slightly below estimated price for faster fill.
         """
-        # TODO: Implement actual sell order
-        self.logger.info(
-            f"SELL ORDER: {position.shares:.4f} shares @ "
-            f"~${position.estimated_share_price:.4f}"
+        if not self.poly.is_ready:
+            self.logger.info(
+                f"SIM SELL: {position.shares:.4f} shares @ "
+                f"~${position.estimated_share_price:.4f}"
+            )
+            return {
+                "order_id": f"sim_sell_{datetime.now(timezone.utc).timestamp()}",
+                "side": "SELL",
+                "size": position.shares,
+                "price": position.estimated_share_price,
+                "status": "SIMULATED",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        # Sell slightly below estimated price for faster fill
+        slippage = settings.polymarket.limit_order_slippage
+        sell_price = max(0.01, position.estimated_share_price - slippage)
+
+        # Get the token_id from the trade that opened this position
+        token_id = self._get_position_token_id(position.cycle_id)
+        if not token_id:
+            self.logger.error("Cannot sell — no token_id found for position")
+            return None
+
+        resp = self.poly.place_limit_order(
+            token_id=token_id,
+            side="SELL",
+            size=position.shares,
+            price=round(sell_price, 2),
         )
 
-        return {
-            "order_id": f"sell_{datetime.now(timezone.utc).timestamp()}",
-            "side": "SELL",
-            "size": position.shares,
-            "price": position.estimated_share_price,
-            "status": "PLACED",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        if resp:
+            self.logger.info(
+                f"SELL ORDER: {position.shares:.4f} shares @ ${sell_price:.4f} "
+                f"(est: ${position.estimated_share_price:.4f})"
+            )
+            return {
+                "order_id": resp.get("orderID") or resp.get("id", "unknown"),
+                "side": "SELL",
+                "size": position.shares,
+                "price": sell_price,
+                "status": "PLACED",
+                "response": resp,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        self.logger.error("Sell order failed")
+        return None
+
+    def _get_position_token_id(self, cycle_id: str) -> Optional[str]:
+        """Look up the token_id from trade history for a given cycle."""
+        for trade in reversed(self._trade_history):
+            if trade.get("cycle_id") == cycle_id and trade.get("token_id"):
+                return trade["token_id"]
+        return None
 
     async def run_cycle(self, cycle_id: str) -> dict:
         """
@@ -194,7 +259,10 @@ class DealerAgent(BaseAgent):
         market = self._find_btc_market()
 
         if not market:
-            # Development mode: simulate the trade
+            if self.poly.is_ready:
+                self.logger.warning("No BTC market found — cannot trade")
+                return {"action": "skip", "reason": "no_market_found"}
+            # Simulation mode: simulate the trade
             trade = self._simulate_trade(decision, cycle_id, entry_btc_price)
             await self.publish("trade_executed", trade)
             return trade
@@ -203,27 +271,36 @@ class DealerAgent(BaseAgent):
         tokens = market.get("tokens", [])
         if decision.direction == Direction.UP:
             target_token = next(
-                (t for t in tokens if t["outcome"].lower() == "yes"), None
+                (t for t in tokens if t["outcome"].upper() in ("YES", "UP")), None
             )
         else:
             target_token = next(
-                (t for t in tokens if t["outcome"].lower() == "no"), None
+                (t for t in tokens if t["outcome"].upper() in ("NO", "DOWN")), None
             )
 
         if not target_token:
             self.logger.error("Could not find target token in market")
             return {"action": "error", "reason": "token_not_found"}
 
+        # Get live CLOB price if available, else use Gamma price
+        token_id = target_token["token_id"]
+        live_price = self.poly.get_price(token_id) if self.poly.is_ready else None
+        token_price = live_price or target_token["price"]
+
         # Calculate shares and place order
-        token_price = target_token["price"]
         shares = decision.position_size_usd / token_price
 
         order = await self._place_order(
-            token_id=target_token["token_id"],
+            token_id=token_id,
             side="BUY",
-            size=shares,
-            price=token_price,
+            size=round(shares, 2),
+            price=round(token_price, 2),
+            cost_usd=decision.position_size_usd,
         )
+
+        if not order:
+            self.logger.error("Order placement failed")
+            return {"action": "error", "reason": "order_failed"}
 
         # Register with PositionManager for active monitoring
         self.position_manager.open_position(
@@ -241,7 +318,7 @@ class DealerAgent(BaseAgent):
             "direction": decision.direction.value,
             "confidence": decision.confidence,
             "market_id": market.get("condition_id"),
-            "token_id": target_token["token_id"],
+            "token_id": token_id,
             "outcome": target_token["outcome"],
             "entry_price": token_price,
             "shares": shares,
