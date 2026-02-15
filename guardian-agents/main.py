@@ -1,15 +1,27 @@
 """
 Guardian Agent Orchestrator — Main Entry Point.
 
-Runs the 1-hour prediction cycle:
-  T-5min: Oracle collects market data snapshot
-  T-4min: Hawk polls whale positions on Hyperliquid
-  T-3min: Quant runs technical analysis on HL candles
-  T-3min: Sentinel analyzes funding rates & OI (parallel with Quant)
-  T-1min: Strategist aggregates all signals → decision
-  T-0:    Dealer executes on Polymarket (if signal is strong)
-  T+55min: Monitor checks system health
-  T+60min: Auditor evaluates previous cycle outcome
+Full 1-hour cycle with active position management:
+
+  PHASE 1 — ANALYZE (minutes 0-5):
+    Step 1: Auditor evaluates previous cycle outcome
+    Step 2: Oracle collects BTC data from Hyperliquid + Binance
+    Step 3: Hawk + Quant + Sentinel analyze in parallel
+    Step 4: Strategist aggregates signals → decision
+    Step 5: Dealer places trade on Polymarket (if signal strong)
+
+  PHASE 2 — MONITOR (minutes 5-55):
+    Dealer actively watches the position:
+      - Polls BTC price from Hyperliquid every 30s
+      - Estimates Polymarket share price movement
+      - Checks: take profit, trailing stop, stop loss
+      - At minute 30: re-runs Hawk+Sentinel for signal flip check
+      - Exits early if any condition triggers
+    Monitor checks system health every 60s in parallel
+
+  PHASE 3 — RESOLVE (minutes 55-60):
+    If still in position: hold to market resolution
+    Auditor will score the result at start of next cycle
 
 Usage:
   python main.py                 # Run the full orchestration loop
@@ -22,10 +34,7 @@ import argparse
 import logging
 import signal
 import uuid
-import sys
 from datetime import datetime, timezone
-
-import structlog
 
 from agents.base import AgentBus
 from agents.oracle import OracleAgent
@@ -48,23 +57,17 @@ def setup_logging():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # Quiet noisy libraries
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
 class Orchestrator:
     """
-    Coordinates the multi-agent prediction cycle.
+    Coordinates the multi-agent prediction cycle with active position management.
 
-    Each cycle:
-      1. Auditor evaluates previous cycle (if any)
-      2. Oracle collects fresh market data
-      3. Hawk + Quant + Sentinel run in parallel
-      4. Strategist makes decision
-      5. Dealer executes trade (if applicable)
-      6. Monitor checks system health
-      7. Dashboard reporter sends updates
+    The key change from v1: after placing a trade, the system does NOT sleep
+    for 60 minutes. Instead, the Dealer actively monitors the position using
+    Hyperliquid BTC price data and can exit early for profit or loss protection.
     """
 
     def __init__(self, dry_run: bool = False):
@@ -83,7 +86,7 @@ class Orchestrator:
         self.quant = QuantAgent(self.bus)
         self.sentinel = SentinelAgent(self.bus, self.hl_client)
         self.strategist = StrategistAgent(self.bus)
-        self.dealer = DealerAgent(self.bus)
+        self.dealer = DealerAgent(self.bus, self.hl_client)
         self.auditor = AuditorAgent(self.bus, self.hl_client)
         self.monitor = MonitorAgent(self.bus)
 
@@ -111,6 +114,9 @@ class Orchestrator:
         self.logger.info("Starting Guardian Agent System...")
         self.logger.info(f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
         self.logger.info(f"Cycle interval: {settings.agent.cycle_minutes} minutes")
+        self.logger.info(f"Exit strategy: TP={settings.agent.exit_take_profit_pct}% / "
+                        f"Trail={settings.agent.exit_trailing_stop_pct}% / "
+                        f"SL={settings.agent.exit_stop_loss_pct}%")
 
         for agent in self.all_agents:
             await agent.start()
@@ -124,31 +130,125 @@ class Orchestrator:
         self.logger.info("Shutting down Guardian Agent System...")
         self._running = False
 
+        # Stop position monitoring if active
+        self.dealer.position_manager.stop_monitoring()
+
         for agent in reversed(self.all_agents):
             await agent.stop()
 
         await self.hl_client.close()
         self.logger.info("System shut down cleanly.")
 
+    async def _mid_window_signal_check(self, position) -> bool:
+        """
+        Re-run Hawk + Sentinel at the mid-window mark to detect signal flips.
+
+        Returns True if the original signal has reversed (should exit).
+        """
+        self.logger.info("=== MID-WINDOW SIGNAL CHECK ===")
+        mid_cycle_id = f"mid_{position.cycle_id}"
+
+        try:
+            # Re-fetch fresh data
+            await self.oracle.execute_cycle(mid_cycle_id)
+
+            # Re-run Hawk and Sentinel in parallel
+            hawk_result, sentinel_result = await asyncio.gather(
+                self.hawk.execute_cycle(mid_cycle_id),
+                self.sentinel.execute_cycle(mid_cycle_id),
+                return_exceptions=True,
+            )
+
+            original_direction = position.direction  # "UP" or "DOWN"
+            flip_signals = 0
+            total_signals = 0
+
+            # Check if Hawk signal flipped
+            if hawk_result and not isinstance(hawk_result, Exception):
+                total_signals += 1
+                if hawk_result.direction.value != original_direction and hawk_result.direction.value != "NEUTRAL":
+                    flip_signals += 1
+                    self.logger.warning(
+                        f"Hawk FLIPPED: was {original_direction}, now {hawk_result.direction.value} "
+                        f"@ {hawk_result.confidence:.0%}"
+                    )
+
+                self.reporter.report_agent_signal(
+                    "Hawk", mid_cycle_id,
+                    f"Mid-check: {hawk_result.direction.value} @ {hawk_result.confidence:.0%}"
+                )
+
+            # Check if Sentinel signal flipped
+            if sentinel_result and not isinstance(sentinel_result, Exception):
+                total_signals += 1
+                if sentinel_result.direction.value != original_direction and sentinel_result.direction.value != "NEUTRAL":
+                    flip_signals += 1
+                    self.logger.warning(
+                        f"Sentinel FLIPPED: was {original_direction}, now {sentinel_result.direction.value} "
+                        f"@ {sentinel_result.confidence:.0%}"
+                    )
+
+                self.reporter.report_agent_signal(
+                    "Sentinel", mid_cycle_id,
+                    f"Mid-check: {sentinel_result.direction.value} @ {sentinel_result.confidence:.0%}"
+                )
+
+            # Exit if BOTH signals flipped (high confidence reversal)
+            if total_signals >= 2 and flip_signals >= 2:
+                self.logger.warning(
+                    f"SIGNAL FLIP CONFIRMED: {flip_signals}/{total_signals} signals reversed"
+                )
+                return True
+
+            # Also exit if one flipped with high confidence AND we're in loss
+            if flip_signals >= 1 and position.unrealized_pnl_pct < -5:
+                self.logger.warning(
+                    "Signal partially flipped + position in loss — exiting"
+                )
+                return True
+
+            self.logger.info(
+                f"Mid-window check: {flip_signals}/{total_signals} flipped — "
+                f"{'HOLD' if flip_signals < 2 else 'EXIT'}"
+            )
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Mid-window signal check failed: {e}")
+            return False  # Don't exit on check failure
+
+    async def _monitor_health_during_window(self, cycle_id: str):
+        """Run Monitor agent periodically during the trade window."""
+        interval = settings.monitor.health_check_interval
+        while self._running and self.dealer.position_manager.has_position:
+            try:
+                await self.monitor.execute_cycle(cycle_id)
+            except Exception as e:
+                self.logger.error(f"Health check failed: {e}")
+            await asyncio.sleep(interval)
+
     async def run_cycle(self) -> dict:
         """
-        Execute one complete prediction cycle.
-
-        Returns a summary dict of the cycle.
+        Execute one complete prediction cycle with active position management.
         """
         self._cycle_count += 1
         cycle_id = f"cycle_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}_{uuid.uuid4().hex[:6]}"
 
-        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"\n{'='*70}")
         self.logger.info(f"CYCLE {self._cycle_count}: {cycle_id}")
-        self.logger.info(f"{'='*60}")
+        self.logger.info(f"{'='*70}")
 
         agent_names = [a.name for a in self.all_agents if a.name != "monitor"]
         self.reporter.report_cycle_start(cycle_id, agent_names)
 
         summary = {"cycle_id": cycle_id, "cycle_number": self._cycle_count}
 
-        # ---- Step 1: Audit previous cycle ----
+        # ============================================================
+        # PHASE 1: ANALYZE — Collect signals and make prediction
+        # ============================================================
+        self.logger.info("--- PHASE 1: ANALYZE ---")
+
+        # Step 1: Audit previous cycle
         self.logger.info("Step 1: Auditing previous cycle...")
         audit_result = await self.auditor.execute_cycle(cycle_id)
         if audit_result:
@@ -161,7 +261,7 @@ class Orchestrator:
             }
             self.reporter.report_cycle_result(cycle_id, summary["previous_result"])
 
-        # ---- Step 2: Oracle collects market data ----
+        # Step 2: Oracle collects market data
         self.logger.info("Step 2: Oracle collecting market data...")
         oracle_data = await self.oracle.execute_cycle(cycle_id)
         if oracle_data:
@@ -172,39 +272,33 @@ class Orchestrator:
                     f"BTC ${price.hl_mid_price:,.0f} | "
                     f"HL-Binance spread: {price.spread_hl_binance}bps"
                 )
-            # Mark data source as healthy
             self.monitor.update_data_source(
                 "hyperliquid_rest",
                 connected=True,
                 last_data_received=datetime.now(timezone.utc),
             )
 
-        # ---- Step 3: Hawk + Quant + Sentinel in parallel ----
+        # Step 3: Hawk + Quant + Sentinel in parallel
         self.logger.info("Step 3: Running Hawk, Quant, Sentinel in parallel...")
-        hawk_task = asyncio.create_task(self.hawk.execute_cycle(cycle_id))
-        quant_task = asyncio.create_task(self.quant.execute_cycle(cycle_id))
-        sentinel_task = asyncio.create_task(self.sentinel.execute_cycle(cycle_id))
-
         whale_signal, tech_signal, sentinel_signal = await asyncio.gather(
-            hawk_task, quant_task, sentinel_task,
+            self.hawk.execute_cycle(cycle_id),
+            self.quant.execute_cycle(cycle_id),
+            self.sentinel.execute_cycle(cycle_id),
             return_exceptions=True,
         )
 
-        # Report signals
         if whale_signal and not isinstance(whale_signal, Exception):
             self.reporter.report_agent_signal(
                 "Hawk", cycle_id,
                 f"{whale_signal.direction.value} @ {whale_signal.confidence:.0%} — "
                 f"{whale_signal.whales_long}L/{whale_signal.whales_short}S"
             )
-
         if tech_signal and not isinstance(tech_signal, Exception):
             self.reporter.report_agent_signal(
                 "Quant", cycle_id,
                 f"{tech_signal.direction.value} @ {tech_signal.confidence:.0%} — "
                 f"RSI {tech_signal.rsi_14:.0f}"
             )
-
         if sentinel_signal and not isinstance(sentinel_signal, Exception):
             self.reporter.report_agent_signal(
                 "Sentinel", cycle_id,
@@ -212,10 +306,9 @@ class Orchestrator:
                 f"Funding {sentinel_signal.funding.hl_funding_rate:.6f}"
             )
 
-        # ---- Step 4: Strategist decides ----
+        # Step 4: Strategist decides
         self.logger.info("Step 4: Strategist aggregating signals...")
         decision = await self.strategist.execute_cycle(cycle_id)
-
         if decision:
             self.reporter.report_decision(
                 cycle_id,
@@ -232,22 +325,87 @@ class Orchestrator:
                 "position_size": decision.position_size_usd,
             }
 
-        # ---- Step 5: Dealer executes ----
+        # Step 5: Dealer places trade
+        trade_placed = False
         if decision and decision.should_trade and not self.dry_run:
-            self.logger.info("Step 5: Dealer executing trade...")
+            self.logger.info("Step 5: Dealer entering position...")
             trade = await self.dealer.execute_cycle(cycle_id)
-            if trade:
+            if trade and trade.get("action") in ("trade", "simulated_trade"):
                 self.reporter.report_trade(cycle_id, trade)
                 summary["trade"] = trade
+                trade_placed = True
         elif self.dry_run and decision and decision.should_trade:
-            self.logger.info("Step 5: DRY RUN — trade would be placed")
-            summary["trade"] = {"action": "dry_run", "would_trade": True}
+            self.logger.info("Step 5: DRY RUN — simulating trade entry...")
+            trade = await self.dealer.execute_cycle(cycle_id)
+            if trade:
+                summary["trade"] = trade
+                trade_placed = True
         else:
             self.logger.info("Step 5: No trade this cycle")
             summary["trade"] = {"action": "skip"}
 
-        # ---- Step 6: Monitor checks health ----
-        self.logger.info("Step 6: Monitor checking system health...")
+        # ============================================================
+        # PHASE 2: MONITOR — Actively manage position during window
+        # ============================================================
+        if trade_placed and self.dealer.position_manager.has_position:
+            self.logger.info("\n--- PHASE 2: MONITOR (active position management) ---")
+            self.logger.info(
+                f"Monitoring for up to {settings.agent.cycle_minutes} minutes | "
+                f"Polling BTC every {settings.agent.exit_poll_interval}s | "
+                f"Mid-window signal check at {settings.agent.exit_mid_check_minute}min"
+            )
+
+            # Run position monitoring and health checks in parallel
+            monitor_task = asyncio.create_task(
+                self._monitor_health_during_window(cycle_id)
+            )
+
+            position_result = await self.dealer.monitor_position(
+                signal_check_fn=self._mid_window_signal_check,
+            )
+
+            # Cancel health monitoring (position is closed)
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
+
+            if position_result:
+                summary["position_result"] = position_result
+                exit_reason = position_result.get("exit_reason", "unknown")
+                realized_pnl = position_result.get("realized_pnl", 0)
+                hold_min = position_result.get("hold_duration_min", 0)
+
+                self.logger.info(
+                    f"\n--- PHASE 2 COMPLETE ---\n"
+                    f"Exit: {exit_reason} | "
+                    f"PnL: ${realized_pnl:+.2f} | "
+                    f"Held: {hold_min:.1f}min | "
+                    f"BTC move: {position_result.get('btc_change_pct', 0):+.2f}%"
+                )
+
+                self.reporter.report_agent_signal(
+                    "Dealer", cycle_id,
+                    f"Position closed: {exit_reason} | "
+                    f"PnL: ${realized_pnl:+.2f} | "
+                    f"Held: {hold_min:.1f}min"
+                )
+        else:
+            # No position — just run health check and wait
+            self.logger.info("\n--- PHASE 2: WAIT (no active position) ---")
+            await self.monitor.execute_cycle(cycle_id)
+
+            # Still need to wait for the window to complete
+            # so the next cycle aligns with the hourly boundary
+            wait_seconds = settings.agent.cycle_minutes * 60
+            self.logger.info(f"Waiting {settings.agent.cycle_minutes}min for next cycle...")
+            await asyncio.sleep(wait_seconds)
+
+        # ============================================================
+        # PHASE 3: RESOLVE — Final health check
+        # ============================================================
+        self.logger.info("\n--- PHASE 3: RESOLVE ---")
         health = await self.monitor.execute_cycle(cycle_id)
         if health:
             perf = None
@@ -267,8 +425,8 @@ class Orchestrator:
                 "alerts": health.active_alerts,
             }
 
-        self.logger.info(f"Cycle {cycle_id} complete.")
-        self.logger.info(f"{'='*60}\n")
+        self.logger.info(f"\nCycle {cycle_id} complete.")
+        self.logger.info(f"{'='*70}\n")
 
         return summary
 
@@ -281,23 +439,22 @@ class Orchestrator:
                 try:
                     summary = await self.run_cycle()
 
-                    # Log summary
                     decision = summary.get("decision", {})
+                    pos_result = summary.get("position_result", {})
                     self.logger.info(
                         f"Cycle summary: {decision.get('direction', 'N/A')} "
-                        f"@ {decision.get('confidence', 0):.0%} — "
-                        f"Trade: {summary.get('trade', {}).get('action', 'N/A')}"
+                        f"@ {decision.get('confidence', 0):.0%} | "
+                        f"Exit: {pos_result.get('exit_reason', 'N/A')} | "
+                        f"PnL: ${pos_result.get('realized_pnl', 0):+.2f}"
                     )
 
                 except Exception as e:
                     self.logger.error(f"Cycle failed: {e}", exc_info=True)
+                    # Wait before retrying to avoid tight error loops
+                    await asyncio.sleep(60)
 
-                # Wait for next cycle
-                wait_seconds = settings.agent.cycle_minutes * 60
-                self.logger.info(
-                    f"Next cycle in {settings.agent.cycle_minutes} minutes..."
-                )
-                await asyncio.sleep(wait_seconds)
+                # No additional sleep needed — the monitoring phase
+                # already consumed the full window duration
 
         except asyncio.CancelledError:
             self.logger.info("Run loop cancelled")
