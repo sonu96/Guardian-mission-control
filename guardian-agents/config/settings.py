@@ -70,6 +70,14 @@ class AgentConfig(BaseSettings):
     max_consecutive_losses: int = 5
     kelly_fraction: float = 0.25  # Quarter-Kelly for conservative sizing
 
+    # Active position management (exit strategies during 1h window)
+    exit_take_profit_pct: float = 40.0   # Sell when share price up 40% from entry
+    exit_trailing_stop_pct: float = 15.0 # After peak, exit if drops 15%
+    exit_stop_loss_pct: float = 30.0     # Hard stop: cut if down 30%
+    exit_mid_check_minute: int = 30      # Re-check signals at 30min mark
+    exit_min_hold_seconds: int = 120     # Hold at least 2min (avoid whipsaw)
+    exit_poll_interval: int = 30         # Check BTC price every 30s during window
+
     class Config:
         env_prefix = "AGENT_"
 
